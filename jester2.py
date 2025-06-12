@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import warnings
 warnings.filterwarnings('ignore')
+from collections import defaultdict
 
 class BayesianPMF:
     """
@@ -212,7 +213,7 @@ class BayesianPMF:
         pred_samples += np.random.normal(0, np.sqrt(self.noise_variance), n_samples)
         return pred_samples
 
-    def evaluate(self, test_data):
+    def evaluate(self, test_data, mean=0.0, std=1.0):
         predictions = self.predict_batch(test_data)
         actual = np.array([rating for _, _, rating in test_data])
         valid_mask = ~np.isnan(predictions)
@@ -220,6 +221,8 @@ class BayesianPMF:
         actual = actual[valid_mask]
         if len(predictions) == 0:
             return np.inf
+        predictions = predictions * std + mean
+        actual = actual * std + mean
         return np.sqrt(mean_squared_error(actual, predictions))
 
     def get_user_recommendations(self, user_id, n_recommendations=10, return_uncertainty=False):
@@ -246,68 +249,101 @@ class BayesianPMF:
                              for joke_idx in top_jokes]
             return recommendations
 
+def filter_users_by_min_ratings(data, min_ratings=20, max_users=None):
+    user_ratings = defaultdict(list)
+    for user_id, joke_id, rating in data:
+        user_ratings[user_id].append((user_id, joke_id, rating))
+    # only use users with enough ratings
+    filtered_data = []
+    for user_id, ratings in user_ratings.items():
+        if len(ratings) >= min_ratings:
+            filtered_data.extend(ratings)
+            if max_users and len(filtered_data) > max_users * min_ratings:
+                break
+    return filtered_data
+
 def load_jester_data(file_path=False, sample_size=None):
-    """Load Jester dataset (same as before)"""
     if file_path is False:
-        # Simulate Jester-like data for demonstration
+        #initial testing
         np.random.seed(42)
         n_users = 1000
         n_jokes = 100
-
-        # Generate some realistic joke rating patterns
         data = []
         for user_id in range(n_users):
-            # Each user rates 15-80 jokes
             n_ratings = np.random.randint(15, 81)
             rated_jokes = np.random.choice(n_jokes, n_ratings, replace=False)
-
-            # User preference bias
             user_bias = np.random.normal(0, 2)
-
             for joke_id in rated_jokes:
-                # Joke quality bias
                 joke_bias = np.random.normal(0, 1.5)
-
-                # Generate rating with some noise
                 rating = user_bias + joke_bias + np.random.normal(0, 1)
                 rating = np.clip(rating, -10, 10)  # Jester scale
-
                 data.append((user_id, joke_id, rating))
-
         if sample_size:
             data = data[:sample_size]
-
         return data
     else:
-        # Real data loading logic (same as before)
-        file_paths=["jester-data-1.xls", "jester-data-2.xls", "jester-data-3.xls"]
+        file_paths = ["jester-data-1.xls", "jester-data-2.xls", "jester-data-3.xls"]
         all_data = []
         user_id_offset = 0
-
         for file_path in file_paths:
             print(f"Loading {file_path}...")
-            df = pd.read_excel(file_path, header=None)
+            try:
+                df = pd.read_excel(file_path, header=None)
+            except FileNotFoundError:
+                print(f"Warning: {file_path} not found, skipping...")
+                continue
+            print(f"Original shape: {df.shape}")
 
-            if df.iloc[:, 0].max() > 100:
+            first_row = df.iloc[0].values
+            print(f"First row sample: {first_row[:10]}...")
+            first_col = df.iloc[:, 0]
+            if first_col.min() > 0 and first_col.max() < df.shape[1]:
+                print(f"Detected count column (range: {first_col.min()}-{first_col.max()}), removing...")
                 df = df.iloc[:, 1:]
+            else:
+                print("First column doesn't look like counts, keeping all columns")
 
-            for i, row in df.iterrows():
-                for joke_id, rating in enumerate(row):
-                    if rating != 99:
-                        all_data.append((user_id_offset + i, joke_id, float(rating)))
-
+            print(f"After preprocessing shape: {df.shape}")
+            all_values = df.values.flatten()
+            non_missing = all_values[~pd.isna(all_values) & (all_values != 99)]
+            print(f"Data range (excluding 99s): [{np.min(non_missing):.2f}, {np.max(non_missing):.2f}]")
+            for user_idx, row in df.iterrows():
+                for joke_idx, rating in enumerate(row):
+                    if pd.isna(rating) or rating == 99:
+                        continue
+                    rating = float(rating)
+                    if rating < -10 or rating > 10:
+                        print(f"WARNING: Rating {rating} outside [-10,10] range for user {user_id_offset + user_idx}, joke {joke_idx}")
+                        # Skip this rating or clip it
+                        rating = np.clip(rating, -10, 10)
+                    all_data.append((user_id_offset + user_idx, joke_idx, rating))
             user_id_offset += len(df)
 
+        print(f"\nFinal dataset stats:")
+        if all_data:
+            ratings = [r for _, _, r in all_data]
+            print(f"Total ratings: {len(all_data)}")
+            print(f"Users: {len(set([x[0] for x in all_data]))}")
+            print(f"Jokes: {len(set([x[1] for x in all_data]))}")
+            print(f"Rating range: [{min(ratings):.2f}, {max(ratings):.2f}]")
+            print(f"Rating mean: {np.mean(ratings):.2f}, std: {np.std(ratings):.2f}")
         if sample_size:
+            np.random.shuffle(all_data)  # Shuffle before sampling
             all_data = all_data[:sample_size]
 
         return all_data
 
-
 def run_bayesian_experiment():
     print("Bayesian PMF w/ uncertainty\n")
     print("Loading data...")
-    data = load_jester_data(False, sample_size=5000)
+    # data, mean, std = load_jester_data(True, sample_size=5000)
+    raw_data = load_jester_data(True)
+    data = filter_users_by_min_ratings(raw_data, min_ratings=30, max_users=2000)
+
+
+    print(f"Filtered to {len(data)} ratings from "
+      f"{len(set([x[0] for x in data]))} users.")
+
     print(f"Loaded {len(data)} ratings")
     print(f"Users: {len(set([x[0] for x in data]))}")
     print(f"Jokes: {len(set([x[1] for x in data]))}")
@@ -317,8 +353,8 @@ def run_bayesian_experiment():
     print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
     print("\nTraining Bayesian PMF...")
     model = BayesianPMF(
-        n_factors=10,
-        learning_rate=0.1,
+        n_factors=25,
+        learning_rate=0.05,
         n_iterations=100,
         prior_variance=1.0,
         noise_variance=1.0,
@@ -341,6 +377,8 @@ def run_bayesian_experiment():
     predictions = predictions[valid_mask]
     uncertainties = uncertainties[valid_mask]
     actual = actual[valid_mask]
+    predictions = np.clip(predictions, -10, 10)
+    uncertainties = np.clip(uncertainties, 0, 5)
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     axes[0, 0].plot(model.elbo_history, label='ELBO')
@@ -355,8 +393,6 @@ def run_bayesian_experiment():
     axes[0, 1].set_title('Learning Curves')
     axes[0, 1].legend()
     axes[0, 1].grid(True)
-
-    # Predictions vs actual w/ uncertainty
     axes[1, 0].errorbar(actual, predictions, yerr=uncertainties,
                        fmt='o', alpha=0.6, capsize=2)
     axes[1, 0].plot([-10, 10], [-10, 10], 'r--', alpha=0.8)
@@ -367,7 +403,7 @@ def run_bayesian_experiment():
     # Uncertainty vs absolute error
     abs_errors = np.abs(actual - predictions)
     axes[1, 1].scatter(uncertainties, abs_errors, alpha=0.6)
-    axes[1, 1].set_xlabel('Prediction Uncertainty (σ)')
+    axes[1, 1].set_xlabel('Prediction Uncertainty')
     axes[1, 1].set_ylabel('Absolute Error')
     axes[1, 1].set_title('Uncertainty vs Error')
     axes[1, 1].grid(True)
